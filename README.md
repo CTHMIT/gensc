@@ -26,7 +26,7 @@ For further information please contact [Chun-Tse Hsu](https://github.com/CTHMIT)
 First, Download the project:
 
 ```bash
-https://github.com/CTHMIT/gensc.git
+git clone https://github.com/CTHMIT/gensc.git
 cd GenSC
 ```
 
