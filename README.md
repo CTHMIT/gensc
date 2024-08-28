@@ -27,7 +27,7 @@ First, Download the project:
 
 ```bash
 git clone https://github.com/CTHMIT/gensc.git
-cd GenSC
+cd gensc
 ```
 
 ## Authorize and execute
