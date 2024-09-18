@@ -459,7 +459,7 @@ class Decoder(nn.Module):
 
 
 class LoadDataset(Dataset):
-    def __init__(self, name='train'):
+    def __init__(self, args, name='train'):
         
         with open(args.data_path + '{}_data.pkl'.format(name), 'rb') as f:
             self.data = pkl.load(f)
@@ -856,142 +856,143 @@ def collate_data(batch):
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def main(Config):
+    def get_args():
+        parser = argparse.ArgumentParser(description="Model Training Arguments")
+        parser.add_argument('--batch_size', type=int, default=128, help="Batch size for training")
+        parser.add_argument('--channel', type=str, default='Rayleigh', help="Channel type")
+        parser.add_argument('--early_stop', type=int, default=15, help="Early stopping criteria")
+        parser.add_argument('--checkpoint_path', type=str, default=os.path.join(os.getcwd(), 'pretrained_model/'), help="Path to save checkpoint")
+        parser.add_argument('--checkpoint_name', type=str, default='checkpoint.pth', help="Checkpoint file name")
+        parser.add_argument('--data_path', type=str, default=os.path.join(os.getcwd(), 'dataset/'), help="Dataset path")
+        parser.add_argument('--output', type=str, default=os.path.join(os.getcwd(), 'output/'), help="Output path")
+    
+        return parser.parse_args()
+    
+    args = get_args()
+    
+    if not os.path.exists(args.checkpoint_path):
+        os.makedirs(args.checkpoint_path)
+    if not os.path.exists(args.output):
+        os.makedirs(args.output)
+    
+    train_data = LoadDataset(args, 'train')
+    test_data = LoadDataset(args, 'test')
+    
+    vocab = json.load(open(args.data_path + 'vocab.json', 'r'))
+    Config.vocab_size = len(vocab)
+    Config.bos_token_id = vocab["<start>"]
+    Config.pad_token_id = vocab['<pad>'] 
+    Config.eos_token_id = vocab['<end>']
+    Config.msk_token_id = vocab['<mask>']
+    
+    print("trian max lenght :", max(map(lambda x: len(x), train_data.data)),"test max lenght :", max(map(lambda x: len(x), test_data.data)))
+    print("Vab sizes : ", Config.vocab_size, '-', True if len(vocab) == Config.vocab_size else False)
+    print("BOS token : ", Config.bos_token_id, '-', True if vocab['<start>'] == Config.bos_token_id else False)
+    print("PAD token : ", Config.pad_token_id, '-', True if vocab['<pad>'] == Config.pad_token_id else False)
+    print("EOS token : ", Config.eos_token_id, '-', True if vocab['<end>'] == Config.eos_token_id else False)
+    print("MSK token : ", Config.msk_token_id, '-', True if vocab['<mask>'] == Config.msk_token_id else False)
+    print("Fading Channel : ", args.channel)
+    
+    model = GenSC(Config).to(device) 
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    
+    try :
+        pretrain_model_path = os.path.join(args.checkpoint_path, args.checkpoint_name)
+        model.load_state_dict(torch.load(pretrain_model_path, weights_only=True))
+        info = f'Use pre-train model'
+    
+    except:
+        initNetParams(model)  
+        info = f'Model init Net Params'
+    
+    print(f'{info} with {args.channel} fading channel with parameters {pytorch_total_params}')
+    
+    Loss_Func = nn.CrossEntropyLoss(reduction = 'none')
+    optimizer = torch.optim.AdamW(model.parameters(),1e-4, betas=(0.9, 0.99), eps=1e-8, weight_decay = 1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',factor=0.75, patience=5)
+    
+    temp, save_target = 0, [float('inf') for _ in range(len(Config.snr_noise_list))]
+    train_list, test_list = [], []
+    epoch = 0
+    start_time = time.time()
+    
+    while temp < args.early_stop:
+        epoch += 1
+        save_model = False
+        train_loss = train_loop(args, Config, model, train_data, Loss_Func, optimizer)
+        valid_loss = valid_loop(args, Config, model, test_data, Loss_Func)
+        train_list.append(train_loss)        
+        test_list.append(valid_loss)            
+            
+        if sum(valid_loss) < sum(save_target) and valid_loss[-1] < save_target[-1]:
+            
+            temp = 0  
+            save_model = True      
+    
+            for idx, value in enumerate(save_target):
+                save_target[idx] = valid_loss[idx]
+    
+            with open(args.checkpoint_path + args.checkpoint_name , 'wb') as f:
+                torch.save(model.state_dict(), f)
+                    
+        else:
+            temp += 1    
+            scheduler.step(valid_loss[-1])              
+    
+        print('Epoch {} - {} times'.format(epoch + 1, temp) + (" ( Model saving ... ) " if save_model else ""))
+        print('Valida loss :',' '.join(['{:.4f}'.format(x) for x in valid_loss]))
+        print('Saving loss :',' '.join(['{:.4f}'.format(x) for x in save_target]))
+            
+    end_time = time.time()     
+    elapsed_time = end_time - start_time
+    hours = int(elapsed_time // 3600)
+    minutes = int((elapsed_time % 3600) // 60)
+    seconds = int(elapsed_time % 60)   
+    
+    plt.plot(range(1,len(train_list)+1), train_list)
+    plt.plot(range(1,len(test_list)+1), test_list, linestyle="--")
+    plt.legend(['Train Loss',"Valid Loss"])
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'Training Loss')
+    plt.savefig(args.output+f'Lossimg')
+    plt.clf() 
+    
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"           
+    model.load_state_dict(torch.load(os.path.join(args.checkpoint_path, args.checkpoint_name), weights_only=True)) 
+    bleu_score ,similar_score = performance(args, Config.snr_noise_list, model, test_data, args.channel)
+    print(f'bleu_score',' '.join(['{:.4f}'.format(x) for x in bleu_score]))
+    print(f'simi_score',' '.join(['{:.4f}'.format(x) for x in similar_score]))   
+    
+    plt.plot(list(range(len(bleu_score.tolist()))), bleu_score.tolist(), marker='o') 
+    plt.xlabel('SNR')
+    plt.ylabel('BleuScore')
+    plt.xticks(list(range(len(bleu_score.tolist()))), Config.snr_noise_list)
+    plt.yticks(np.linspace(0,1,11))
+    plt.title(f'BleuScore')
+    plt.savefig(args.output+f'BleuScore_img')
+    plt.clf()
+    
+    plt.plot(list(range(len(similar_score.tolist()))), similar_score.tolist(), marker='o') 
+    plt.xlabel('SNR')
+    plt.ylabel('SimilarScore')
+    plt.xticks(list(range(len(similar_score.tolist()))), Config.snr_noise_list) 
+    plt.yticks(np.linspace(0,1,11))
+    plt.title(f'SimilarScore')
+    plt.savefig(args.output+f'SimilarScore_img')
+    plt.clf()
+    
+    bleu_score_dict = {}
+    bleu_score_dict['Channel'] = args.channel
+    bleu_score_dict['BleuScore'] = bleu_score.tolist()
+    bleu_score_dict['SimilarScore'] = similar_score.tolist()
+    bleu_score_dict['Total_params'] = pytorch_total_params  
+    bleu_score_dict['TrainingTime'] = f"{hours} hrs, {minutes} mins, {seconds} secs"
+    
+    df = pd.DataFrame.from_dict(bleu_score_dict, orient='index')
+    df.to_csv(args.output+f'summary.csv')
 
-def get_args():
-    parser = argparse.ArgumentParser(description="Model Training Arguments")
-    parser.add_argument('--batch_size', type=int, default=128, help="Batch size for training")
-    parser.add_argument('--channel', type=str, default='Rayleigh', help="Channel type")
-    parser.add_argument('--early_stop', type=int, default=15, help="Early stopping criteria")
-    parser.add_argument('--checkpoint_path', type=str, default=os.path.join(os.getcwd(), 'pretrained_model/'), help="Path to save checkpoint")
-    parser.add_argument('--checkpoint_name', type=str, default='checkpoint.pth', help="Checkpoint file name")
-    parser.add_argument('--data_path', type=str, default=os.path.join(os.getcwd(), 'dataset/'), help="Dataset path")
-    parser.add_argument('--output', type=str, default=os.path.join(os.getcwd(), 'output/'), help="Output path")
-
-    return parser.parse_args()
-
-args = get_args()
-
-if not os.path.exists(args.checkpoint_path):
-    os.makedirs(args.checkpoint_path)
-if not os.path.exists(args.output):
-    os.makedirs(args.output)
-
-train_data = LoadDataset('train')
-test_data = LoadDataset('test')
-
-vocab = json.load(open(args.data_path + 'vocab.json', 'r'))
-Config.vocab_size = len(vocab)
-Config.bos_token_id = vocab["<start>"]
-Config.pad_token_id = vocab['<pad>'] 
-Config.eos_token_id = vocab['<end>']
-Config.msk_token_id = vocab['<mask>']
-
-print("trian max lenght :", max(map(lambda x: len(x), train_data.data)),"test max lenght :", max(map(lambda x: len(x), test_data.data)))
-print("Vab sizes : ", Config.vocab_size, '-', True if len(vocab) == Config.vocab_size else False)
-print("BOS token : ", Config.bos_token_id, '-', True if vocab['<start>'] == Config.bos_token_id else False)
-print("PAD token : ", Config.pad_token_id, '-', True if vocab['<pad>'] == Config.pad_token_id else False)
-print("EOS token : ", Config.eos_token_id, '-', True if vocab['<end>'] == Config.eos_token_id else False)
-print("MSK token : ", Config.msk_token_id, '-', True if vocab['<mask>'] == Config.msk_token_id else False)
-print("Fading Channel : ", args.channel)
-
-model = GenSC(Config).to(device) 
-pytorch_total_params = sum(p.numel() for p in model.parameters())
-
-try :
-    pretrain_model_path = os.path.join(args.checkpoint_path, args.checkpoint_name)
-    model.load_state_dict(torch.load(pretrain_model_path, weights_only=True))
-    info = f'Use pre-train model'
-
-except:
-    initNetParams(model)  
-    info = f'Model init Net Params'
-
-print(f'{info} with {args.channel} fading channel with parameters {pytorch_total_params}')
-
-Loss_Func = nn.CrossEntropyLoss(reduction = 'none')
-optimizer = torch.optim.AdamW(model.parameters(),1e-4, betas=(0.9, 0.99), eps=1e-8, weight_decay = 1e-4)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',factor=0.75, patience=5)
-
-temp, save_target = 0, [float('inf') for _ in range(len(Config.snr_noise_list))]
-train_list, test_list = [], []
-epoch = 0
-start_time = time.time()
-
-while temp < args.early_stop:
-    epoch += 1
-    save_model = False
-    train_loss = train_loop(args, Config, model, train_data, Loss_Func, optimizer)
-    valid_loss = valid_loop(args, Config, model, test_data, Loss_Func)
-    train_list.append(train_loss)        
-    test_list.append(valid_loss)            
-        
-    if sum(valid_loss) < sum(save_target) and valid_loss[-1] < save_target[-1]:
-        
-        temp = 0  
-        save_model = True      
-
-        for idx, value in enumerate(save_target):
-            save_target[idx] = valid_loss[idx]
-
-        with open(args.checkpoint_path + args.checkpoint_name , 'wb') as f:
-            torch.save(model.state_dict(), f)
-                
-    else:
-        temp += 1    
-        scheduler.step(valid_loss[-1])              
-
-    print('Epoch {} - {} times'.format(epoch + 1, temp) + (" ( Model saving ... ) " if save_model else ""))
-    print('Valida loss :',' '.join(['{:.4f}'.format(x) for x in valid_loss]))
-    print('Saving loss :',' '.join(['{:.4f}'.format(x) for x in save_target]))
-        
-end_time = time.time()     
-elapsed_time = end_time - start_time
-hours = int(elapsed_time // 3600)
-minutes = int((elapsed_time % 3600) // 60)
-seconds = int(elapsed_time % 60)   
-
-plt.plot(range(1,len(train_list)+1), train_list)
-plt.plot(range(1,len(test_list)+1), test_list, linestyle="--")
-plt.legend(['Train Loss',"Valid Loss"])
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title(f'Training Loss')
-plt.savefig(args.output+f'Lossimg')
-plt.clf() 
-
-os.environ["TOKENIZERS_PARALLELISM"] = "false"           
-model.load_state_dict(torch.load(os.path.join(args.checkpoint_path, args.checkpoint_name), weights_only=True)) 
-bleu_score ,similar_score = performance(args, Config.snr_noise_list, model, test_data, args.channel)
-print(f'bleu_score',' '.join(['{:.4f}'.format(x) for x in bleu_score]))
-print(f'simi_score',' '.join(['{:.4f}'.format(x) for x in similar_score]))   
-
-plt.plot(list(range(len(bleu_score.tolist()))), bleu_score.tolist(), marker='o') 
-plt.xlabel('SNR')
-plt.ylabel('BleuScore')
-plt.xticks(list(range(len(bleu_score.tolist()))), Config.snr_noise_list)
-plt.yticks(np.linspace(0,1,11))
-plt.title(f'BleuScore')
-plt.savefig(args.output+f'BleuScore_img')
-plt.clf()
-
-plt.plot(list(range(len(similar_score.tolist()))), similar_score.tolist(), marker='o') 
-plt.xlabel('SNR')
-plt.ylabel('SimilarScore')
-plt.xticks(list(range(len(similar_score.tolist()))), Config.snr_noise_list) 
-plt.yticks(np.linspace(0,1,11))
-plt.title(f'SimilarScore')
-plt.savefig(args.output+f'SimilarScore_img')
-plt.clf()
-
-bleu_score_dict = {}
-bleu_score_dict['Channel'] = args.channel
-bleu_score_dict['BleuScore'] = bleu_score.tolist()
-bleu_score_dict['SimilarScore'] = similar_score.tolist()
-bleu_score_dict['Total_params'] = pytorch_total_params  
-bleu_score_dict['TrainingTime'] = f"{hours} hrs, {minutes} mins, {seconds} secs"
-
-df = pd.DataFrame.from_dict(bleu_score_dict, orient='index')
-df.to_csv(args.output+f'summary.csv')
-
-
+if __name__ =="__main__":
+    main(Config)
 
